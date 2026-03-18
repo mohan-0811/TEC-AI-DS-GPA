@@ -4,7 +4,7 @@ import re
 import pandas as pd
 import io
 
-# --- CONFIGURATION ---
+
 st.set_page_config(
     page_title="AI/DS Result Converter",
     page_icon="📊",
