@@ -3,8 +3,9 @@ import pdfplumber
 import re
 import pandas as pd
 import io
+from collections import defaultdict
 
-
+# --- CONFIGURATION ---
 st.set_page_config(
     page_title="AI/DS Result Converter",
     page_icon="📊",
@@ -24,7 +25,7 @@ st.markdown("""
 grade_points = {
     "O": 10, "S": 10, "A+": 9, "A": 8, "B+": 7,
     "B": 6, "C": 5, "U": 0, "UA": 0,
-    "W": 0, "SA": 0, "WH": 0
+    "W": 0, "SA": 0, "WH": 0, "AB": 0
 }
 
 syllabus = {
@@ -59,129 +60,188 @@ syllabus = {
 }
 
 def get_sem_subjects(sem):
+    """Get subjects for a specific semester - ordered by typical PDF appearance"""
     mapping = {
-        1: ["BS3171","CY3151","GE3151","GE3152","GE3171","GE3172","HS3151","MA3151","PH3151"],
-        2: ["AD3251","AD3271","BE3251","GE3251","GE3252","GE3271","GE3272","HS3251","MA3251","PH3256"],
-        3: ["AD3301","AD3311","AD3351","AD3381","AD3391","AL3391","CS3351","GE3361","MA3354"],
-        4: ["AD3491","AL3451","AL3452","CS3591","GE3451","MA3391"],
-        5: ["AD3501","AD3511","AD3512","CCS334","CCS335","CCW331","CS3551","CW3551"],
-        6: ["CCS332","CCS341","CCS345","CCS371","CS3661","CS3691","SB8051"],
-        7: ["AI3021","GE3751","GE3791","NM1117","OGI352"],
+        1: ["HS3151", "MA3151", "PH3151", "CY3151", "GE3151", "GE3152", "BS3171", "GE3171", "GE3172"],
+        2: ["MA3251", "PH3256", "BE3251", "AD3251", "GE3251", "GE3252", "HS3251", "GE3271", "AD3271", "GE3272"],
+        3: ["MA3354", "AD3391", "AD3351", "CS3351", "AL3391", "AD3301", "GE3361", "AD3381", "AD3311"],
+        4: ["MA3391", "CS3591", "AL3452", "AL3451", "AD3491", "GE3451"],
+        5: ["AD3501", "CCS334", "CCS335", "CCW331", "CS3551", "CW3551", "AD3511", "AD3512"],
+        6: ["CCS332", "CCS341", "CCS345", "CCS371", "CS3691", "CS3661", "SB8051"],
+        7: ["AI3021", "OGI352", "GE3751", "GE3791", "NM1117"],
         8: ["AD3811"]
     }
     return mapping.get(sem, [])
 
-# --- LOGIC ---
-def process_pdf(pdf_file):
-    student_records = {}
-    current_sem = 0
-    current_header_subjects = []
-    CODE_REGEX = re.compile(r"^[A-Z]{2,3}\d{3,4}$")
-
-    with pdfplumber.open(pdf_file) as pdf:
-        text = "\n".join(page.extract_text() for page in pdf.pages if page.extract_text())
+def extract_grades_from_line(line, expected_subjects):
+    """Extract grades from student line more robustly"""
+    parts = line.strip().split()
+    if len(parts) < 2 or not re.match(r"^\d{10,12}", parts[0]):
+        return None, None
     
-    lines = text.split("\n")
-    for line in lines:
-        if "Semester No." in line:
-            match = re.search(r"Semester No.\s*:\s*(\d+)", line)
-            if match:
-                current_sem = int(match.group(1))
-                current_header_subjects = []
-            continue
-        
-        strip_line = line.strip()
-        if not re.match(r"^\d{10,12}", strip_line):
-            tokens = strip_line.split()
-            codes = [w for w in tokens if CODE_REGEX.match(w) or w in syllabus]
-            if len(codes) >= 2:
-                current_header_subjects = codes
-            continue
+    reg_no = parts[0]
+    
+    # Extract all potential grades from the end of the line
+    grades = []
+    name_parts = []
+    
+    for part in reversed(parts[1:]):
+        if part in grade_points:
+            grades.insert(0, part)
+        else:
+            name_parts.insert(0, part)
+    
+    # Clean name (remove any stray codes)
+    name = " ".join([p for p in name_parts if not re.match(r"^[A-Z]{2,3}\d{3,4}$", p)])
+    
+    return reg_no, {"name": name, "grades": grades[:len(expected_subjects)]}
 
-        parts = strip_line.split()
-        reg_no = parts[0]
-        subjects_to_use = current_header_subjects if current_header_subjects else get_sem_subjects(current_sem)
-        
-        grades = []
-        name_parts = []
-        for p in reversed(parts[1:]):
-            if len(grades) < len(subjects_to_use) and p in grade_points:
-                grades.insert(0, p)
-            else:
-                name_parts.insert(0, p)
-        
-        name = " ".join([w for w in name_parts if not CODE_REGEX.match(w)])
-        total_credits, total_points = 0, 0
-        limit = min(len(subjects_to_use), len(grades))
-        
-        for i in range(limit):
-            code = subjects_to_use[i]
-            grade = grades[i]
-            _, credits = syllabus.get(code, ("Unknown", 3))
-            if grade not in ["UA", "W", "WH", "SA"]:
+def calculate_gpa(reg_no, sem, grades, subjects):
+    """Calculate GPA for given semester"""
+    total_credits = 0
+    total_points = 0
+    
+    for i, (code, grade) in enumerate(zip(subjects, grades)):
+        if code in syllabus and grade in grade_points:
+            _, credits = syllabus[code]
+            points = grade_points[grade]
+            
+            # Skip failed/withdrawn subjects for GPA calculation
+            if grade not in ["U", "UA", "W", "WH", "SA", "AB"]:
                 total_credits += credits
-                total_points += grade_points.get(grade, 0) * credits
-        
-        gpa = round((total_points / total_credits) + 1e-9, 2) if total_credits > 0 else 0.00
-        if reg_no not in student_records: student_records[reg_no] = {}        
-        student_records[reg_no][current_sem] = {"name": name, "gpa": gpa}
+                total_points += points * credits
+    
+    gpa = round(total_points / total_credits, 2) if total_credits > 0 else 0.00
+    return gpa
 
+def process_pdf(pdf_file):
+    student_records = defaultdict(dict)
+    CODE_REGEX = re.compile(r"^[A-Z]{2,3}\d{3,4}$")
+    
+    with pdfplumber.open(pdf_file) as pdf:
+        full_text = "\n".join(page.extract_text() for page in pdf.pages if page.extract_text())
+    
+    lines = [line.strip() for line in full_text.split("\n") if line.strip()]
+    
+    current_sem = 0
+    debug_info = []  # For troubleshooting
+    
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        
+        # Detect semester
+        if "Semester No." in line or "SEMESTER" in line.upper():
+            sem_match = re.search(r"(?:Semester|SEM)\s*(?:No\.?|NO)\s*[:\-]?\s*(\d+)", line, re.IGNORECASE)
+            if sem_match:
+                current_sem = int(sem_match.group(1))
+                debug_info.append(f"Found semester {current_sem}")
+        
+        # Skip if not a student record line
+        if not re.match(r"^\d{10,12}", line):
+            i += 1
+            continue
+        
+        # Get expected subjects for this semester
+        expected_subjects = get_sem_subjects(current_sem)
+        if not expected_subjects:
+            debug_info.append(f"No subjects found for semester {current_sem}")
+            i += 1
+            continue
+        
+        # Extract student data
+        reg_no, student_data = extract_grades_from_line(line, expected_subjects)
+        if reg_no and student_data:
+            grades = student_data["grades"]
+            gpa = calculate_gpa(reg_no, current_sem, grades, expected_subjects)
+            
+            student_records[reg_no][current_sem] = {
+                "name": student_data["name"],
+                "gpa": gpa,
+                "subjects_used": expected_subjects[:len(grades)],
+                "grades_found": grades
+            }
+            debug_info.append(f"Processed {reg_no}: GPA {gpa} for sem {current_sem}")
+        
+        i += 1
+    
+    # Create final dataframe
     final_rows = []
     for reg_no, sem_data in student_records.items():
+        # Use highest semester available
         max_sem = max(sem_data.keys())
         data = sem_data[max_sem]
         batch_year = "20" + str(reg_no)[4:6] if len(str(reg_no)) >= 6 else "Unknown"
+        
         final_rows.append({
-            "Batch": batch_year, "Semester": max_sem, 
-            "Reg No": reg_no, "Name": data["name"], "GPA": data["gpa"]
+            "Batch": batch_year,
+            "Semester": max_sem,
+            "Reg No": reg_no,
+            "Name": data["name"],
+            "GPA": data["gpa"],
+            "Subjects Used": ", ".join(data["subjects_used"][:3]) + "..." if len(data["subjects_used"]) > 3 else ", ".join(data["subjects_used"])
         })
-    return pd.DataFrame(final_rows).sort_values(by=["Batch", "Semester", "Reg No"])
+    
+    df = pd.DataFrame(final_rows).sort_values(by=["Batch", "Semester", "Reg No"])
+    
+    # Show debug info in expander
+    with st.expander("🔧 Debug Info (Click to expand)"):
+        st.write("Processing log:")
+        for info in debug_info[-20:]:  # Last 20 entries
+            st.write(info)
+        st.info(f"Total students processed: {len(df)}")
+    
+    return df
 
 # --- UI LAYOUT ---
 st.sidebar.title("📌 Instructions")
 st.sidebar.info("""
 1. Upload the official Semester Result PDF.
-2. The app will extract Registration No, Names, and calculate GPA.
-3. Preview the results in the table.
-4. Download as a formatted Excel file.
+2. Works for **ALL semesters (1-8)** with improved parsing.
+3. Fixed grade-subject alignment issues.
+4. Preview results and download Excel.
 """)
 
 st.title("🎓 Academic Performance Parser")
-st.subheader("Transform PDF Results into Data Insights")
+st.subheader("✅ Fixed for ALL Semesters (1-8)")
 
 uploaded_file = st.file_uploader("Drop your PDF file here", type="pdf")
 
 if uploaded_file:
-    with st.spinner('⚙️ Analyzing PDF structure and calculating GPAs...'):
+    with st.spinner('⚙️ Processing PDF with improved semester detection...'):
         try:
             df = process_pdf(uploaded_file)
             
-            # SUCCESS METRICS
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Students Found", len(df))
-            col2.metric("Highest GPA", f"{df['GPA'].max():.2f}")
-            col3.metric("Average GPA", f"{df['GPA'].astype(float).mean():.2f}")
+            if df.empty:
+                st.warning("No student data found. Please check if PDF format matches expected structure.")
+            else:
+                # SUCCESS METRICS
+                col1, col2, col3 = st.columns(3)
+                col1.metric("Students Found", len(df))
+                col2.metric("Highest GPA", f"{df['GPA'].max():.2f}")
+                col3.metric("Average GPA", f"{df['GPA'].mean():.2f}")
 
-            # DATA PREVIEW
-            st.write("### 🔍 Data Preview")
-            st.dataframe(df, use_container_width=True)
+                # DATA PREVIEW
+                st.write("### 🔍 Results Preview")
+                st.dataframe(df[["Batch", "Semester", "Reg No", "Name", "GPA"]], use_container_width=True)
 
-            # EXCEL GENERATION
-            output = io.BytesIO()
-            with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                df.to_excel(writer, index=False, sheet_name='GPA_Results')
-            
-            st.write("---")
-            st.download_button(
-                label="📥 Download Excel Report",
-                data=output.getvalue(),
-                file_name=f"Results_Summary.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-            st.balloons()
+                # EXCEL GENERATION
+                output = io.BytesIO()
+                with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                    df.to_excel(writer, index=False, sheet_name='GPA_Results')
+                
+                st.write("---")
+                st.success("✅ Processing complete!")
+                st.download_button(
+                    label="📥 Download Excel Report",
+                    data=output.getvalue(),
+                    file_name=f"Results_S{int(df['Semester'].max())}-{len(df)}students.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+                st.balloons()
 
         except Exception as e:
-            st.error(f"An error occurred: {e}")
-            st.info("Ensure the PDF matches the expected format.")
+            st.error(f"Error: {str(e)}")
+            st.info("💡 Tips:\n• Ensure PDF is official result sheet\n• Try different PDF if issue persists")
 else:
-    st.info("👋 Welcome! Please upload a PDF to get started.")
+    st.info("👋 Upload a PDF to analyze semester results!")
